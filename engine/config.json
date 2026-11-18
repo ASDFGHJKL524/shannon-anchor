@@ -1,0 +1,368 @@
+{
+  "_README": "dsh-focus-mode 引擎配置。protectShells=保护终端；skipSession0=不碰服务；hostProtected=任何档案都绝不冻结的进程（DSH、工具运行时、本地模型服务、显示叠加层、远程会话）；profiles 只冻结明确列出的白名单，未列出的一律跳过。脚本内另有硬编码保护：反作弊、杀毒（含 360）、系统关键进程、会话 0、自身进程链、以及一切映像位于 Windows 目录下的进程，本文件无法解除。",
+  "protectShells": true,
+  "skipSession0": true,
+  "hostProtected": [
+    "DeepSeek Harness",
+    "dsh",
+    "node",
+    "deno",
+    "bun",
+    "python",
+    "pythonw",
+    "ffmpeg",
+    "ffprobe",
+    "NVIDIA Overlay",
+    "NVIDIA Share",
+    "nvsphelper64",
+    "llama-server",
+    "ollama",
+    "ollama_llama_server",
+    "koboldcpp",
+    "lmstudio",
+    "mstsc",
+    "rdpclip",
+    "putty",
+    "ssh",
+    "mintty",
+    "ThrottleStop",
+    "WinMemoryCleaner"
+  ],
+  "idleByDefault": [
+    "Weixin",
+    "WeChat",
+    "WeChatAppEx",
+    "QQ",
+    "TIM",
+    "DingTalk",
+    "OneDrive",
+    "OneDrive.Sync.Service",
+    "Dropbox",
+    "GoogleDriveFS",
+    "BaiduNetdisk"
+  ],
+  "safeTargets": [
+    "chrome",
+    "msedge",
+    "msedgewebview2",
+    "firefox",
+    "brave",
+    "opera",
+    "vivaldi",
+    "chromium",
+    "Discord",
+    "Slack",
+    "Teams",
+    "ms-teams",
+    "Zoom",
+    "Telegram",
+    "WhatsApp",
+    "Skype",
+    "Lark",
+    "Feishu",
+    "Weixin",
+    "WeChat",
+    "QQ",
+    "DingTalk",
+    "wps*",
+    "et",
+    "wpp",
+    "Spotify",
+    "foobar2000",
+    "PotPlayerMini64",
+    "vlc",
+    "mpv",
+    "QQMusic",
+    "cloudmusic",
+    "OneDrive",
+    "Dropbox",
+    "GoogleDriveFS",
+    "BaiduNetdisk*",
+    "Logitech*",
+    "lghub*",
+    "iCUE*",
+    "Corsair*",
+    "Razer*",
+    "SteelSeriesGG",
+    "RadeonSoftware",
+    "Everything"
+  ],
+  "selectRules": [
+    {
+      "name": "游戏平台保持运行",
+      "match": "steam|steamwebhelper|GameOverlayUI|EpicGamesLauncher|EpicWebHelper|Battle.net|GalaxyClient|GOGGalaxy|EADesktop|EALocalHostSvc|EABackgroundService|UbisoftConnect|upc|UplayService|RiotClientServices|WeGame|wegame|XboxPcApp|GameBar",
+      "action": "skip"
+    },
+    {
+      "name": "聊天/同步/下载只降 QoS",
+      "match": "Weixin|WeChat|WeChatAppEx|QQ|TIM|DingTalk|Lark|Feishu|OneDrive*|Dropbox|GoogleDriveFS|BaiduNetdisk*|Thunder*|qbittorrent|utorrent|BitComet|FreeDownloadManager|IDMan|aria2c",
+      "action": "idle"
+    },
+    {
+      "name": "播放器只降 QoS(不中断声音)",
+      "match": "Spotify|foobar2000|vlc|mpv|PotPlayerMini64|QQMusic|cloudmusic",
+      "action": "idle"
+    },
+    {
+      "name": "虚拟机只降 QoS(不中断 guest)",
+      "match": "vmware-vmx|vmware-authd|VBoxSVC|VirtualBoxVM|qemu-system*",
+      "action": "idle"
+    },
+    {
+      "name": "安卓模拟器只降 QoS（不冻结 guest，避免安卓系统卡死）",
+      "match": "dnplayer|Ld9BoxHeadless|LdVBoxHeadless|AndrowsVm|ABoxHeadless|MuMuPlayer|NemuHeadless|Nox|NoxVMHandle|HD-Player|BlueStacks",
+      "action": "idle"
+    },
+    {
+      "name": "Adobe 后台与厂商控制台冻结",
+      "match": "CCXProcess|CoreSync|AdobeIPCBroker|Adobe Desktop Service|AdobeUpdateService|AdobeARM|Logitech*|lghub*|iCUE*|Corsair*|Razer*|SteelSeriesGG|RadeonSoftware|amdow|AMDRSSrcExt|cncmd",
+      "action": "suspend"
+    },
+    {
+      "name": "常驻助手/挂机类后台冻结",
+      "match": "WorkBuddy|Everything|TranslucentTB|cncmd",
+      "action": "suspend",
+      "minMemoryMB": 30
+    },
+    {
+      "name": "其余一律不碰",
+      "match": "*",
+      "action": "skip"
+    }
+  ],
+  "profiles": {
+    "task": {
+      "scope": "Broad",
+      "mode": "Suspend",
+      "minMemoryMB": 0,
+      "exclude": [
+        "Dock_64",
+        "360tray",
+        "360Safe",
+        "360sd",
+        "360rp",
+        "ZhuDongFangYu",
+        "QHActiveDefense",
+        "explorer",
+        "ShellExperienceHost",
+        "StartMenuExperienceHost",
+        "SearchHost",
+        "TextInputHost",
+        "ChsIME",
+        "SogouIme*",
+        "SGTool",
+        "GameInputRedistService",
+        "XboxService"
+      ],
+      "rules": [
+        {
+          "name": "微信QQ冻结（不看消息；传文件时切过去自动解冻）",
+          "match": "Weixin|WeChat|WeChatAppEx|QQ|TIM",
+          "action": "suspend"
+        },
+        {
+          "name": "同步/下载只降 QoS（别断传输）",
+          "match": "OneDrive*|Dropbox|GoogleDriveFS|BaiduNetdisk*|Thunder*|qbittorrent|utorrent|BitComet|FreeDownloadManager|IDMan|aria2c|DingTalk|Lark|Feishu",
+          "action": "idle"
+        },
+        {
+          "name": "播放器只降 QoS(不中断声音)",
+          "match": "Spotify|foobar2000|vlc|mpv|PotPlayerMini64|QQMusic|cloudmusic",
+          "action": "idle"
+        },
+        {
+          "name": "游戏平台保持运行（不冻结，避免游戏闪退）",
+          "match": "steam|steamwebhelper|GameOverlayUI|gameoverlayui64|EpicGamesLauncher|EpicWebHelper|Battle.net|GalaxyClient|GOGGalaxy|EADesktop|EALocalHostSvc|EABackgroundService|UbisoftConnect|upc|UplayService|RiotClientServices|WeGame|wegame|XboxPcApp|GameBar|REDlauncher",
+          "action": "skip"
+        },
+        {
+          "name": "虚拟机只降 QoS(不中断 guest)",
+          "match": "vmware-vmx|vmware-authd|VBoxSVC|VirtualBoxVM|qemu-system*",
+          "action": "idle"
+        },
+        {
+          "name": "安卓模拟器只降 QoS（不冻结 guest，避免安卓系统卡死）",
+          "match": "dnplayer|Ld9BoxHeadless|LdVBoxHeadless|AndrowsVm|ABoxHeadless|MuMuPlayer|NemuHeadless|Nox|NoxVMHandle|HD-Player|BlueStacks",
+          "action": "idle"
+        },
+        {
+          "name": "Adobe 后台与厂商控制台冻结",
+          "match": "CCXProcess|CoreSync|AdobeIPCBroker|Adobe Desktop Service|AdobeUpdateService|AdobeARM|Logitech*|lghub*|iCUE*|Corsair*|Razer*|SteelSeriesGG|RadeonSoftware|amdow|AMDRSSrcExt|cncmd",
+          "action": "suspend"
+        },
+        {
+          "name": "常驻助手/挂机类后台冻结",
+          "match": "WorkBuddy|Everything|TranslucentTB",
+          "action": "suspend"
+        },
+        {
+          "name": "其余后台冻结（专注模式核心）",
+          "match": "*",
+          "action": "suspend"
+        }
+      ]
+    },
+    "deep": {
+      "scope": "Broad",
+      "mode": "Suspend",
+      "minMemoryMB": 120,
+      "exclude": [
+        "mstsc",
+        "rdpclip",
+        "putty",
+        "ssh",
+        "mintty",
+        "NVIDIA Overlay",
+        "NVIDIA Share"
+      ],
+      "rules": [
+        {
+          "name": "微信QQ冻结（不看消息；传文件时切过去自动解冻）",
+          "match": "Weixin|WeChat|WeChatAppEx|QQ|TIM",
+          "action": "suspend"
+        },
+        {
+          "name": "同步/下载只降 QoS（别断传输）",
+          "match": "OneDrive*|Dropbox|GoogleDriveFS|BaiduNetdisk*|Thunder*|qbittorrent|utorrent|BitComet|FreeDownloadManager|IDMan|aria2c|DingTalk|Lark|Feishu",
+          "action": "idle"
+        },
+        {
+          "name": "播放器只降 QoS(不中断声音)",
+          "match": "Spotify|foobar2000|vlc|mpv|PotPlayerMini64|QQMusic|cloudmusic",
+          "action": "idle"
+        },
+        {
+          "name": "游戏平台保持运行（不冻结，避免游戏闪退）",
+          "match": "steam|steamwebhelper|GameOverlayUI|EpicGamesLauncher|EpicWebHelper|Battle.net|GalaxyClient|GOGGalaxy|EADesktop|EALocalHostSvc|EABackgroundService|UbisoftConnect|upc|UplayService|RiotClientServices|WeGame|wegame|XboxPcApp|GameBar",
+          "action": "skip"
+        },
+        {
+          "name": "浏览器/编辑器/Office 冻结",
+          "match": "chrome|msedge|firefox|brave|opera|vivaldi|chromium|code|devenv|pycharm64|idea64|webstorm64|goland64|rider64|sublime_text|notepad++|WINWORD|EXCEL|POWERPNT|wps*|et|wpp",
+          "action": "suspend",
+          "minMemoryMB": 200
+        },
+        {
+          "name": "Adobe/设计/Notion 冻结",
+          "match": "Adobe*|Creative Cloud*|Photoshop|Illustrator|Premiere Pro|After Effects|InDesign|Lightroom|Audition|Animate|Figma|Notion",
+          "action": "suspend",
+          "minMemoryMB": 150
+        },
+        {
+          "name": "虚拟机冻结",
+          "match": "vmware-vmx|vmware-authd|VBoxSVC|VirtualBoxVM|qemu-system*",
+          "action": "suspend",
+          "minMemoryMB": 200
+        },
+        {
+          "name": "安卓模拟器只降 QoS（不冻结 guest，避免安卓系统卡死）",
+          "match": "dnplayer|Ld9BoxHeadless|LdVBoxHeadless|AndrowsVm|ABoxHeadless|MuMuPlayer|NemuHeadless|Nox|NoxVMHandle|HD-Player|BlueStacks",
+          "action": "idle"
+        },
+        {
+          "name": "厂商控制台/外设软件冻结",
+          "match": "Logitech*|lghub*|iCUE*|Corsair*|Razer*|SteelSeriesGG|RadeonSoftware|amdow|AMDRSSrcExt|cncmd",
+          "action": "suspend"
+        },
+        {
+          "name": "常驻助手/挂机类后台冻结",
+          "match": "WorkBuddy|Everything|TranslucentTB",
+          "action": "suspend"
+        },
+        {
+          "name": "其余一律不碰",
+          "match": "*",
+          "action": "skip"
+        }
+      ]
+    },
+    "performance": {
+      "scope": "Broad",
+      "mode": "Suspend",
+      "minMemoryMB": 100,
+      "exclude": [
+        "mstsc",
+        "rdpclip",
+        "putty",
+        "ssh",
+        "mintty",
+        "NVIDIA Overlay",
+        "NVIDIA Share"
+      ],
+      "rules": [
+        {
+          "name": "微信QQ冻结（不看消息；传文件时切过去自动解冻）",
+          "match": "Weixin|WeChat|WeChatAppEx|QQ|TIM",
+          "action": "suspend"
+        },
+        {
+          "name": "同步/下载只降 QoS（别断传输）",
+          "match": "OneDrive*|Dropbox|GoogleDriveFS|BaiduNetdisk*|Thunder*|qbittorrent|utorrent|BitComet|FreeDownloadManager|IDMan|aria2c|DingTalk|Lark|Feishu",
+          "action": "idle"
+        },
+        {
+          "name": "播放器只降 QoS(不中断声音)",
+          "match": "Spotify|foobar2000|vlc|mpv|PotPlayerMini64|QQMusic|cloudmusic",
+          "action": "idle"
+        },
+        {
+          "name": "游戏平台保持运行（不冻结，避免游戏闪退）",
+          "match": "steam|steamwebhelper|GameOverlayUI|EpicGamesLauncher|EpicWebHelper|Battle.net|GalaxyClient|GOGGalaxy|EADesktop|EALocalHostSvc|EABackgroundService|UbisoftConnect|upc|UplayService|RiotClientServices|WeGame|wegame|XboxPcApp|GameBar",
+          "action": "skip"
+        },
+        {
+          "name": "浏览器/编辑器/Office 冻结",
+          "match": "chrome|msedge|firefox|brave|opera|vivaldi|chromium|code|devenv|pycharm64|idea64|webstorm64|goland64|rider64|sublime_text|notepad++|WINWORD|EXCEL|POWERPNT|wps*|et|wpp",
+          "action": "suspend",
+          "minMemoryMB": 150
+        },
+        {
+          "name": "Adobe/设计/Notion 冻结",
+          "match": "Adobe*|Creative Cloud*|Photoshop|Illustrator|Premiere Pro|After Effects|InDesign|Lightroom|Audition|Animate|Figma|Notion",
+          "action": "suspend",
+          "minMemoryMB": 100
+        },
+        {
+          "name": "虚拟机冻结",
+          "match": "vmware-vmx|vmware-authd|VBoxSVC|VirtualBoxVM|qemu-system*",
+          "action": "suspend",
+          "minMemoryMB": 150
+        },
+        {
+          "name": "安卓模拟器只降 QoS（不冻结 guest，避免安卓系统卡死）",
+          "match": "dnplayer|Ld9BoxHeadless|LdVBoxHeadless|AndrowsVm|ABoxHeadless|MuMuPlayer|NemuHeadless|Nox|NoxVMHandle|HD-Player|BlueStacks",
+          "action": "idle"
+        },
+        {
+          "name": "厂商控制台/外设软件冻结",
+          "match": "Logitech*|lghub*|iCUE*|Corsair*|Razer*|SteelSeriesGG|RadeonSoftware|amdow|AMDRSSrcExt|cncmd",
+          "action": "suspend"
+        },
+        {
+          "name": "常驻助手/挂机类后台冻结",
+          "match": "WorkBuddy|Everything|TranslucentTB",
+          "action": "suspend"
+        },
+        {
+          "name": "其余一律不碰",
+          "match": "*",
+          "action": "skip"
+        }
+      ],
+      "hostBoost": {
+        "enabled": true,
+        "priority": "idle",
+        "eco": true,
+        "memPriority": 1,
+        "trim": true
+      }
+    }
+  },
+  "hostBoost": {
+    "enabled": true,
+    "priority": "idle",
+    "eco": true,
+    "memPriority": 1,
+    "trim": true
+  }
+}

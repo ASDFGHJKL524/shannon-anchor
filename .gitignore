@@ -1,0 +1,51 @@
+# Runtime data — never committed.
+# The manual, identity, memory index, stats, hash chain, quarantine and all
+# curation journals are somebody's personal history. They live beside the code
+# on purpose, which makes an accidental `git add .` easy. This file is the
+# guard: it is the one thing that keeps private data out of the repository.
+runtime/
+**/runtime/
+data/
+*.runtime/
+
+# Local snapshots and backups
+backup/
+backups/
+snapshot/
+snapshots/
+tools/snapshots/
+
+# Engine runtime state (focus mode writes these while it runs)
+engine/history/
+engine/logs/
+engine/run/
+engine/state/
+
+# Scratch and stale copies
+.test-tmp/
+work/
+lib/lib/
+*.bak
+*.bak-*
+test-run*.log
+test-exit.txt
+
+# Evaluation corpora tied to one person's manual
+tools/recall_labels.jsonl
+
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+.npm/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local config overrides that may contain real paths
+user.json
+*.local.json

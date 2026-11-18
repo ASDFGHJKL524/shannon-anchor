@@ -1,0 +1,90 @@
+{
+  "_note": "Shipped defaults. Do not edit here — put your overrides in conf/user.json. Upgrade overwrites this file only.",
+  "manualRoot": "~/.dsh/shannon-anchor",
+  "guardWrites": true,
+  "guardDeletes": true,
+  "injectManualHints": true,
+  "triggers": null,
+  "coldConfirmedDays": 30,
+  "staleConfirmedDays": 90,
+  "coldInferredDays": 15,
+  "staleInferredDays": 45,
+  "candidatePromoteHeat": 3,
+  "candidateAutoPromote": false,
+  "distill": {
+    "mode": "off",
+    "enabled": false,
+    "debounceMs": 600000,
+    "maxPending": 20
+  },
+  "embedding": {
+    "backend": "local",
+    "dim": 256,
+    "baseUrl": null,
+    "apiKey": null,
+    "model": null,
+    "command": null,
+    "args": null,
+    "timeoutMs": 30000,
+    "maxChars": 500,
+    "minChars": 80,
+    "maxDepth": 4
+  },
+  "integrity": {
+    "reviewThreshold": 0.25,
+    "rejectThreshold": 0.55,
+    "similarity": 0.55
+  },
+  "predict": {
+    "enabled": false,
+    "floor": 0.46,
+    "limit": 3,
+    "turns": 1,
+    "english": false
+  },
+  "voice": {
+    "enabled": false,
+    "maxPending": 8,
+    "maxLines": 60,
+    "promptMaxAgeHours": 24
+  },
+  "evict": {
+    "observe": false,
+    "voiceExpireDays": 3,
+    "distillExpireDays": 3
+  },
+  "review": {
+    "enabled": true,
+    "inject": true,
+    "maxPending": 6,
+    "promptMaxAgeHours": 24
+  },
+  "loopGuard": {
+    "enabled": true,
+    "windowChars": 200,
+    "ngram": 8,
+    "repeatThreshold": 3,
+    "maxRetries": 2,
+    "cooldownMs": 8000
+  },
+  "coreGuard": {
+    "enabled": true,
+    "mode": "enforce",
+    "paths": [
+      "~/.dsh/shannon-anchor/manual",
+      "~/.dsh/shannon-anchor/identity.md",
+      "~/.dsh/shannon-anchor/memory.json",
+      "~/.dsh/shannon-anchor/voice",
+      "~/.dsh/AGENTS.md"
+    ]
+  },
+  "focus": {
+    "enabled": false,
+    "defaultMode": "task",
+    "timeoutMs": 180000,
+    "autoStart": false,
+    "autoStartDelayMs": 12000,
+    "autoDetect": false,
+    "autoProfileSwitch": false
+  }
+}

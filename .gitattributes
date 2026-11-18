@@ -1,0 +1,8 @@
+# Normalize line endings on commit; check out native on Windows.
+* text=auto eol=lf
+
+# PowerShell and batch files keep CRLF so Windows PowerShell 5.1 can read them.
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf

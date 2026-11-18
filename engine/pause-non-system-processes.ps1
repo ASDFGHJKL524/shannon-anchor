@@ -1,0 +1,714 @@
+﻿<#
+  GameBoost · 游戏前暂停非系统进程
+  机制：NtSuspendProcess 冻结全部线程 + EmptyWorkingSet 回收工作集；-Mode Idle 则只降 QoS（零风险可逆）
+  安全：四层保护 = IsProcessCritical(查询) + 名字黑名单(反作弊/杀软/系统件,参数不可覆盖) + 自身进程链 + 前台全屏兜底
+  恢复：必须用 resume-non-system-processes.ps1（指纹与原始状态记录在 state\current.json）
+  注意：本文件须以 UTF-8 with BOM 保存，否则 PowerShell 5.1 会把中文按 ANSI 解析并报语法错误。
+#>
+[CmdletBinding()]
+param(
+  [ValidateSet('Safe','Broad','All')][string]$Scope = 'Safe',
+  [ValidateSet('Suspend','Idle')][string]$Mode  = 'Suspend',
+  [string[]]$Only, [string[]]$Exclude, [string]$Game, [string]$BoostGame,
+  [switch]$IncludeAgent, [switch]$IncludeShell, [switch]$SkipVisible,
+  [switch]$NoChildren, [switch]$NoTrim, [switch]$ReSuspend,
+  [int]$AutoResumeMinutes = 0, [string]$ResumeWhenProcessExits,
+  [switch]$DryRun, [switch]$Yes, [switch]$Quiet, [switch]$DefenderHint,
+  [switch]$EmitJson, [string]$JsonOut, [string]$NamesFile,
+  [string]$Profile, [string]$RuleFile, [switch]$NoRules,
+  [int]$NewProcGraceSec = 60
+)
+$ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+
+# ---------------------------------------------------------------- 1. 原生 API
+# 常量来源：Windows SDK 10.0.16299 processthreadsapi.h + 本机实测
+#   ProcessMemoryPriority = 0, ProcessPowerThrottling = 4
+#   PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1, PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+#   MEMORY_PRIORITY_VERY_LOW = 1 ... MEMORY_PRIORITY_NORMAL = 5
+#   PROCESS_SUSPEND_RESUME=0x0800 QUERY_INFORMATION=0x0400 SET_INFORMATION=0x0200 SET_QUOTA=0x0100 QUERY_LIMITED_INFORMATION=0x1000
+if (-not ('GB' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Text;
+public static class GB {
+  const uint M_FULL = 0x0F00;  // SUSPEND_RESUME|QUERY_INFORMATION|SET_INFORMATION|SET_QUOTA（冻结+回收工作集所需）
+  const uint M_SUSP = 0x1800;  // SUSPEND_RESUME|QUERY_LIMITED_INFORMATION（受保护进程只能给这些）
+  const int  CLS_MEMPRIO = 0;
+  const int  CLS_POWER   = 4;
+  const uint PRIO_IDLE   = 0x40, PRIO_HIGH = 0x80;
+
+  [DllImport("ntdll.dll")] static extern int NtSuspendProcess(IntPtr h);
+  [DllImport("ntdll.dll")] static extern int NtResumeProcess(IntPtr h);
+  [DllImport("psapi.dll", SetLastError=true)] static extern bool EmptyWorkingSet(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint a, bool i, int pid);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool IsProcessCritical(IntPtr h, out bool c);
+  [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool QueryFullProcessImageNameW(IntPtr h, int f, StringBuilder name, ref int size);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetProcessInformation(IntPtr h, int c, IntPtr b, int s);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetProcessInformation(IntPtr h, int c, IntPtr b, int s);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern uint GetPriorityClass(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetPriorityClass(IntPtr h, uint c);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr p, uint a, out IntPtr t);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GetCurrentProcess();
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr t, int cls, IntPtr buf, int len, out IntPtr ret);
+  [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthority(IntPtr sid, uint idx);
+  [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr w, out uint p);
+  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr w, out RECT r);
+  [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr w);
+  delegate bool EnumProc(IntPtr w, IntPtr l);
+  public struct RECT { public int L; public int T; public int R; public int B; }
+
+  static IntPtr Open(int pid, out uint used, out int err) {
+    IntPtr h = OpenProcess(M_FULL, false, pid); used = M_FULL; err = 0;
+    if (h == IntPtr.Zero) { err = Marshal.GetLastWin32Error(); h = OpenProcess(M_SUSP, false, pid); used = M_SUSP; }
+    if (h == IntPtr.Zero) err = Marshal.GetLastWin32Error();
+    return h;
+  }
+  static int GetMem(IntPtr h) { IntPtr b = Marshal.AllocHGlobal(4); try { Marshal.WriteInt32(b, -1);
+      if (GetProcessInformation(h, CLS_MEMPRIO, b, 4)) return Marshal.ReadInt32(b); return -1; } finally { Marshal.FreeHGlobal(b); } }
+  static bool SetMem(IntPtr h, int v) { IntPtr b = Marshal.AllocHGlobal(4); try { Marshal.WriteInt32(b, v);
+      return SetProcessInformation(h, CLS_MEMPRIO, b, 4); } finally { Marshal.FreeHGlobal(b); } }
+  static int GetEco(IntPtr h) { IntPtr b = Marshal.AllocHGlobal(12); try { Marshal.WriteInt32(b, 1); Marshal.WriteInt32(b, 4, 0); Marshal.WriteInt32(b, 8, 0);
+      if (GetProcessInformation(h, CLS_POWER, b, 12)) return (Marshal.ReadInt32(b, 8) & 1); return -1; } finally { Marshal.FreeHGlobal(b); } }
+  static bool SetEco(IntPtr h, bool on) { IntPtr b = Marshal.AllocHGlobal(12); try { Marshal.WriteInt32(b, 1); Marshal.WriteInt32(b, 4, 1); Marshal.WriteInt32(b, 8, on ? 1 : 0);
+      return SetProcessInformation(h, CLS_POWER, b, 12); } finally { Marshal.FreeHGlobal(b); } }
+
+  // 返回 "OK|origPrio|origMem|origEco|suspendCount|trimmed|mask" 或 "E<win32err>" / "NT<ntstatus>"
+  public static string Suspend(int pid, bool trim, bool eco, int memPrio) {
+    uint used; int err; IntPtr h = Open(pid, out used, out err);
+    if (h == IntPtr.Zero) return "E" + err;
+    try {
+      int op = (int)GetPriorityClass(h), om = GetMem(h), oe = GetEco(h);
+      SetMem(h, memPrio);
+      if (eco) SetEco(h, true);
+      int st = NtSuspendProcess(h);
+      if (st != 0) return "NT" + st.ToString("X8");
+      bool trimmed = false;
+      if (trim && used == M_FULL) trimmed = EmptyWorkingSet(h);
+      return "OK|" + op + "|" + om + "|" + oe + "|1|" + (trimmed ? 1 : 0) + "|" + (used == M_FULL ? "full" : "susp");
+    } finally { CloseHandle(h); }
+  }
+  // 只降 QoS，不冻结
+  public static string Idle(int pid, bool eco, int memPrio) {
+    uint used; int err; IntPtr h = Open(pid, out used, out err);
+    if (h == IntPtr.Zero) return "E" + err;
+    try {
+      int op = (int)GetPriorityClass(h), om = GetMem(h), oe = GetEco(h);
+      SetPriorityClass(h, PRIO_IDLE); SetMem(h, memPrio); if (eco) SetEco(h, true);
+      return "OK|" + op + "|" + om + "|" + oe + "|0|0|" + (used == M_FULL ? "full" : "susp");
+    } finally { CloseHandle(h); }
+  }
+  public static string Query(int pid) {
+    uint used; int err; IntPtr h = Open(pid, out used, out err);
+    if (h == IntPtr.Zero) return "E" + err;
+    try { return ((int)GetPriorityClass(h)) + "|" + GetMem(h) + "|" + GetEco(h); } finally { CloseHandle(h); }
+  }
+  // 当前进程令牌的完整性等级：TOKEN_QUERY(0x8) + TokenIntegrityLevel(25) → SID 最后一个子授权
+  public static string Integrity() {
+    IntPtr t;
+    if (!OpenProcessToken(GetCurrentProcess(), 0x0008, out t)) return "E" + Marshal.GetLastWin32Error();
+    IntPtr b = IntPtr.Zero;
+    try {
+      // 先传空缓冲区取所需长度：TOKEN_MANDATORY_LABEL 比一个指针大，按 IntPtr.Size 给会撞 ERROR_INSUFFICIENT_BUFFER(122)
+      IntPtr need;
+      GetTokenInformation(t, 25, IntPtr.Zero, 0, out need);
+      int len = (int)need;
+      if (len <= 0) len = 32;
+      b = Marshal.AllocHGlobal(len);
+      IntPtr ret;
+      if (!GetTokenInformation(t, 25, b, len, out ret)) return "E" + Marshal.GetLastWin32Error();
+      IntPtr pSid = Marshal.ReadIntPtr(b);
+      if (pSid == IntPtr.Zero) return "E0";
+      int n = Marshal.ReadByte(GetSidSubAuthorityCount(pSid));
+      if (n <= 0) return "E1";
+      return "OK|" + (int)(uint)Marshal.ReadInt32(GetSidSubAuthority(pSid, (uint)(n - 1)));
+    } finally { Marshal.FreeHGlobal(b); CloseHandle(t); }
+  }
+  public static string Critical(int pid) {
+    uint used; int err; IntPtr h = Open(pid, out used, out err);
+    if (h == IntPtr.Zero) return "E" + err;
+    try { bool c; if (!IsProcessCritical(h, out c)) return "E" + Marshal.GetLastWin32Error(); return c ? "T" : "F"; }
+    finally { CloseHandle(h); }
+  }
+  public static void Boost(int pid) {
+    uint used; int err; IntPtr h = Open(pid, out used, out err);
+    if (h == IntPtr.Zero) return;
+    try { SetPriorityClass(h, PRIO_HIGH); SetEco(h, false); } finally { CloseHandle(h); }
+  }
+  public static string ImagePath(int pid) {
+    uint used; int err; IntPtr h = Open(pid, out used, out err);
+    if (h == IntPtr.Zero) return "";
+    try {
+      StringBuilder sb = new StringBuilder(1024); int len = sb.Capacity;
+      if (!QueryFullProcessImageNameW(h, 0, sb, ref len)) return "";
+      return sb.ToString();
+    } finally { CloseHandle(h); }
+  }
+  public static int FgPid() {
+    IntPtr w = GetForegroundWindow(); if (w == IntPtr.Zero) return 0;
+    uint p; GetWindowThreadProcessId(w, out p); return (int)p;
+  }
+  public static int FgFullscreenPid() {
+    IntPtr w = GetForegroundWindow(); if (w == IntPtr.Zero) return 0;
+    RECT r; if (!GetWindowRect(w, out r)) return 0;
+    int sw = GetSystemMetrics(0), sh = GetSystemMetrics(1);
+    if ((r.R - r.L) >= sw && (r.B - r.T) >= sh && r.L <= 0 && r.T <= 0) { uint p; GetWindowThreadProcessId(w, out p); return (int)p; }
+    return 0;
+  }
+  public static string VisiblePids() {
+    StringBuilder sb = new StringBuilder();
+    EnumWindows(delegate(IntPtr w, IntPtr l) {
+      if (IsWindowVisible(w)) { RECT r; if (GetWindowRect(w, out r) && (r.R - r.L) > 8 && (r.B - r.T) > 8) {
+        uint p; GetWindowThreadProcessId(w, out p); if (p != 0) sb.Append(p).Append(","); } }
+      return true;
+    }, IntPtr.Zero);
+    return sb.ToString();
+  }
+}
+'@
+}
+
+# ---------------------------------------------------------------- 2. 路径与日志
+$Root     = Split-Path -Parent $MyInvocation.MyCommand.Path
+$StateDir = Join-Path $Root 'state'; $LogDir = Join-Path $Root 'logs'; $HistDir = Join-Path $Root 'history'
+foreach ($d in @($StateDir, $LogDir, $HistDir)) { if (-not (Test-Path $d)) { New-Item -ItemType Directory $d -Force | Out-Null } }
+$StateFile = Join-Path $StateDir 'current.json'
+# 2026-11-17 日志轮转：原先每次扫描都按秒新建一个文件，专注模式开着时 30 秒一个，
+# 17 天攒了 10166 个（19 MB）。改成一天一个、追加写。
+$LogFile   = Join-Path $LogDir ('pause-' + (Get-Date -Format 'yyyyMMdd') + '.log')
+# 逐进程明细在当天文件超过 LogBareMB 后不再追加（汇总行照写），单日体量因此封顶。
+# 14 天前的按天日志在每次启动时清掉；只匹配 ^pause-\d{8}\.log$，老的非按天存量不动。
+# 这是进程自清理，不是人手删除，不经过删除守卫 —— 守卫管的是助手动手删。
+$LogKeepDays  = 14
+$script:LogBareMB = 8
+$script:LogBare = $false
+try {
+  if (Test-Path -LiteralPath $LogFile) { $script:LogBare = ((Get-Item -LiteralPath $LogFile).Length / 1MB) -ge $script:LogBareMB }
+  $cut = (Get-Date).Date.AddDays(-$LogKeepDays)
+  Get-ChildItem -LiteralPath $LogDir -File -Filter 'pause-*.log' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^pause-\d{8}\.log$' -and $_.LastWriteTime -lt $cut } |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+} catch { }
+function Log([string]$m, [string]$c = 'Gray') { if (-not $Quiet) { Write-Host $m -ForegroundColor $c }; Add-Content -Path $LogFile -Value ((Get-Date -Format 'HH:mm:ss') + '  ' + $m) -Encoding UTF8 }
+function Fail([string]$m) { Log $m 'Red'; exit 1 }
+# 高频路径用的缓冲写日志：逐条 Add-Content 每次都要开关文件，批量冻结时是主要开销之一
+$script:fastBuf = New-Object System.Collections.Generic.List[string]
+function LogFast([string]$m, [string]$c = 'Gray') {
+  if (-not $Quiet) { Write-Host $m -ForegroundColor $c }
+  if ($script:LogBare) { return }
+  $script:fastBuf.Add((Get-Date -Format 'HH:mm:ss') + '  ' + $m)
+  if ($script:fastBuf.Count -ge 40) { Add-Content -Path $LogFile -Value $script:fastBuf.ToArray() -Encoding UTF8; $script:fastBuf.Clear() }
+}
+function FlushFast { if ($script:fastBuf.Count -gt 0) { Add-Content -Path $LogFile -Value $script:fastBuf.ToArray() -Encoding UTF8; $script:fastBuf.Clear() } }
+
+$cfg = @{ protectShells = $true; safeTargets = @(); idleByDefault = @() }
+$cfgPath = Join-Path $Root 'config.json'
+if (Test-Path $cfgPath) { try { $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Fail ('config.json 解析失败: ' + $_.Exception.Message) } }
+# 显式名单优先于规则表：-Only/-NamesFile 是用户明确点名，规则表只服务「自动选择」，此时不参与筛选。
+# 注意档案的 exclude 与系统硬保护（反作弊/杀毒/会话0/自身链）不因显式名单而放宽。
+$script:ExplicitList = [bool]($Only -or $NamesFile)
+# 从文件读取目标名单（避开 PS 5.1 向原生进程传数组时的引号转义坑：GUI 多选会因此失败）
+if ($NamesFile) {
+  if (-not (Test-Path $NamesFile)) { Fail ('名单文件不存在: ' + $NamesFile) }
+  $fromFile = @(Get-Content $NamesFile -Encoding UTF8 | Where-Object { $_.Trim() -ne '' } | ForEach-Object { $_.Trim() })
+  if ($Only) { $Only += $fromFile } else { $Only = $fromFile }
+  Log ('从名单文件读入 ' + $fromFile.Count + ' 个目标名: ' + ($fromFile -join ', ')) 'Cyan'
+}
+
+# ---------------------------------------------------------------- 2b. 配置档案与规则表（自动选择）
+# -Profile 可以是 config.json 里 profiles 的键名，也可以是一个 JSON 文件路径。
+# 规则表字段：name(说明)、match(通配，多个用 | 分隔)、action(suspend|idle|skip)、minMemoryMB(下限，达到才命中)、maxMemoryMB(上限，低于才命中)
+$script:RuleSet = @()
+$script:ActiveProfile = $null
+if ($Profile) {
+  $prof = $null
+  if (Test-Path $Profile) {
+    try { $prof = Get-Content $Profile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Fail ('档案文件解析失败: ' + $_.Exception.Message) }
+    $Profile = '文件:' + (Split-Path $Profile -Leaf)
+  } else {
+    if (-not $cfg.profiles) { Fail 'config.json 里没有 profiles 段，无法按名称使用 -Profile（可改为传 JSON 文件路径）' }
+    $prop = $cfg.profiles.PSObject.Properties | Where-Object { $_.Name -eq $Profile }
+    if (-not $prop) { Fail ('找不到档案: ' + $Profile + '；可用档案: ' + (($cfg.profiles.PSObject.Properties | ForEach-Object { $_.Name }) -join ', ')) }
+    $prof = $prop.Value
+  }
+  $script:ActiveProfile = $prof
+  if ($prof.scope) { $Scope = [string]$prof.scope }
+  if ($prof.mode) { $Mode = [string]$prof.mode }
+  if ($prof.include) { if ($Only) { $Only += @($prof.include) } else { $Only = @($prof.include) } }
+  if ($prof.exclude) { if ($Exclude) { $Exclude += @($prof.exclude) } else { $Exclude = @($prof.exclude) } }
+  if ($prof.skipVisible) { $SkipVisible = $true }
+  if ($prof.rules) { $script:RuleSet += @($prof.rules) }
+  $extra = ''
+  if ($prof.minMemoryMB) { $extra += ' 内存门槛=' + $prof.minMemoryMB + 'MB' }
+  if ($prof.exclude) { $extra += ' 排除=' + (@($prof.exclude).Count) + ' 条' }
+  Log ('已加载档案 [' + $Profile + ']：scope=' + $Scope + ' mode=' + $Mode + $extra) 'Cyan'
+}
+if ($RuleFile) {
+  if (-not (Test-Path $RuleFile)) { Fail ('规则表文件不存在: ' + $RuleFile) }
+  try {
+    # 注意：不能写成 @(Get-Content ... | ConvertFrom-Json)——PS 5.1 里 ConvertFrom-Json 把顶层数组当作
+    # 单个对象输出，@() 会把它套成一个元素（嵌套），多规则 + minMemoryMB 时会直接崩。
+    $rawRules = Get-Content $RuleFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $script:RuleSet += @($rawRules)
+  } catch { Fail ('规则表解析失败: ' + $_.Exception.Message) }
+}
+if ($NoRules) { $script:RuleSet = @() }
+elseif ($script:RuleSet.Count -eq 0 -and $cfg.selectRules) { $script:RuleSet = @($cfg.selectRules) }
+if ($script:RuleSet.Count -gt 0) { Log ('规则表就绪：' + $script:RuleSet.Count + ' 条（按顺序匹配，首个命中生效）') 'Cyan' }
+
+# ---------------------------------------------------------------- 3. 保护名单
+# 反作弊/杀软/系统件为硬编码，任何参数都无法解除
+$Protected = @(
+  'System','Idle','Registry','Secure System','Memory Compression','smss','csrss','wininit','winlogon','services',
+  'lsass','lsaiso','dwm','audiodg','fontdrvhost','svchost','WmiPrvSE','WmiApSrv','unsecapp','Locator',
+  'vmms','vmcompute','vmnat','vmnetdhcp','wslservice','WUDFHost','WUDFCompanionHost',
+  'taskhostw','sihost','ShellHost','ShellExperienceHost','StartMenuExperienceHost','SearchHost','TextInputHost',
+  'RuntimeBroker','ctfmon','ChsIME','TabTip','AppActions','CrossDeviceResume',
+  'FnKey','ApplicationFrameHost','UserOOBEBroker','GameInputRawInputProxy',
+  'WidgetBoard','WidgetService','MicrosoftStartFeedProvider',
+  'nvcontainer','NVDisplay.Container','RtkAudUService64','RtkBtManServ','amdfendrsr','amdpmfservice','amdpmfserviceuser',
+  'AmdPpkgSvc','atieclxx','atiesrxx','FnHotkeyCapsLKNumLK','FnHotkeyUtility','LnvSvcFdn','LenovoUtilityService',
+  'MsMpEng','NisSrv','SecurityHealthService','SecurityHealthSystray','MpDefenderCoreService','DefenderSessionHelper',
+  '360tray','360Safe','360Safe64','safemon','safesvr','safebox','ZhuDongFangYu','360rp','360rp_pt','360ca','360sd',
+  '360huamon','360QuSvc','QihuService','CimaNetService','360UDiskPro','360udiskguard','360NetBase','360Base',
+  'ACE-Tray','ACE-Guard','SGuard','SGuard64','EACefSubProcess','EABackgroundService','EasyAntiCheat','BEService',
+  'vgc','vgtray','LAVService','usysdiag','wsctrl11'
+)
+if ($cfg.protectShells -and -not $IncludeShell) { $Protected += @('conhost','OpenConsole','WindowsTerminal','cmd','powershell','pwsh','wscript','cscript') }
+if (-not $IncludeShell) { $Protected += @('explorer') }
+if ($Exclude) { $Protected += $Exclude }
+if ($Game)    { $Protected += $Game }
+if (-not $IncludeAgent -and $cfg.hostProtected) { $Protected += @($cfg.hostProtected) }   # 宿主/编辑器名单由 config.json 的 hostProtected 提供
+
+# 自身进程链：祖先链（终端/宿主）+ 真正的自家后代，绝不触碰
+# 关键：不能把「祖先的所有后代」都算进来——explorer 之下是整个用户会话，那样会漏掉浏览器等内存大头
+$selfSet = New-Object 'System.Collections.Generic.HashSet[int]'
+$map = @{}
+$nameOf = @{}
+try {
+  $allProc = Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId > 0' -Property ProcessId, ParentProcessId, Name
+  foreach ($p in $allProc) { $map[[int]$p.ProcessId] = [int]$p.ParentProcessId; $nameOf[[int]$p.ProcessId] = [string]$p.Name }
+  $cur = [int]$PID
+  while ($cur -gt 0 -and $selfSet.Add($cur)) { $cur = [int]$map[$cur] }
+  foreach ($k in @($map.Keys)) {
+    $c = [int]$k; $hops = 0
+    while ($c -gt 0 -and $hops -lt 64) {
+      if ($c -eq [int]$PID) { [void]$selfSet.Add([int]$k); break }
+      $c = [int]$map[$c]; $hops++
+    }
+  }
+} catch { Log ('警告：无法构建进程树(' + $_.Exception.Message + ')，退回仅按名字保护') 'Yellow' }
+
+# ---------------------------------------------------------------- 4. 候选筛选
+$fgPid = [GB]::FgFullscreenPid()
+if ($fgPid -gt 0) { Log ('兜底：前台全屏窗口属 pid ' + $fgPid + '，强制排除') 'Yellow' }
+# 当前前台窗口 PID（不排除，只用于预审时标注“会假死”）
+$fgAnyPid = [GB]::FgPid()
+$visPids = @()
+if ($SkipVisible) { $visPids = @(([GB]::VisiblePids() -split ',') | Where-Object { $_ } | ForEach-Object { [int]$_ }) }
+
+# 按映像路径判定系统件，不依赖我事先猜到名字。三种判定：
+#   windows    → exe 在 Windows 目录下，永不冻结
+#   unreadable → 当前权限读不到路径，说明它在更高完整性级别（系统件/杀软/厂商守护），同样永不冻结；
+#                我既无法分类，OpenProcess 也多半被拒，去试只会撞杀软自检
+#   app        → 路径可读且不在 Windows 目录下，才允许进入候选
+$winPrefixes = @()
+foreach ($wd in @($env:SystemRoot, $env:windir, 'C:\WINDOWS')) {
+  if ($wd) { $t = $wd.TrimEnd('\'); if ($t -and -not ($winPrefixes -contains $t)) { $winPrefixes += ($t + '\') } }
+}
+$imageVerdict = @{}
+$getImageVerdict = {
+  param($p)
+  $key = [int]$p.Id
+  if ($imageVerdict.ContainsKey($key)) { return $imageVerdict[$key] }
+  $ip = ''
+  try { $ip = [GB]::ImagePath($key) } catch { $ip = '' }
+  $v = 'unreadable'
+  if ($ip) {
+    $v = 'app'
+    foreach ($pre in $winPrefixes) {
+      if ($ip.StartsWith($pre, [StringComparison]::OrdinalIgnoreCase)) { $v = 'windows'; break }
+    }
+  }
+  $imageVerdict[$key] = $v
+  return $v
+}
+
+$isProtected = {
+  param($p)
+  if ($Protected -contains $p.ProcessName) { return $true }
+  if ($selfSet.Contains([int]$p.Id)) { return $true }
+  if ($p.Id -le 4) { return $true }
+  if ((& $getImageVerdict $p) -ne 'app') { return $true }   # 硬门：Windows 目录映像与路径读不到的进程永不冻结
+  if ($cfg.skipSession0 -ne $false -and $p.SessionId -eq 0) { return $true }   # 默认不碰会话0(服务)；可在 config.json 改 skipSession0
+  if ($fgPid -gt 0 -and $p.Id -eq $fgPid) { return $true }
+  if ($fgAnyPid -gt 0 -and $p.Id -eq $fgAnyPid) { return $true }   # 用户 2026-11-06：正在用的（前台窗口）不冻
+  if ($visPids -contains [int]$p.Id) { return $true }
+  return $false
+}
+$matchesScope = {
+  param($p)
+  if ($Only) { return ($Only -contains $p.ProcessName) }
+  if ($Scope -eq 'Safe') { foreach ($pat in $cfg.safeTargets) { if ($p.ProcessName -like $pat) { return $true } } return $false }
+  return ($p.SessionId -gt 0)   # Broad/All：只取用户会话，绝不碰会话 0 的服务
+}
+
+$allProc = @(Get-Process -ErrorAction SilentlyContinue)
+# 先把映像判定跑满所有进程：后面的自检要报的是全量比例，不是「筛选顺手走到哪算哪」
+foreach ($p in $allProc) { & $getImageVerdict $p | Out-Null }
+# 新进程保护期：刚启动的进程先不冻，给窗口留出出现的时间。
+# 2026-11-03 实测：从 Dock 启动应用时，进程创建到窗口出现有几秒空档，正好撞上扫描就会被挂起，
+# 窗口永远不出现，前台检测也看不到它——表现为「点了没反应」。默认 60 秒，0 表示关闭。
+$nowUtc = (Get-Date).ToUniversalTime()
+$isNewProc = {
+  param($p)
+  if ($NewProcGraceSec -le 0) { return $false }
+  try {
+    $st = $p.StartTime.ToUniversalTime()
+    return (($nowUtc - $st).TotalSeconds -lt $NewProcGraceSec)
+  } catch { return $false }
+}
+$roots   = @($allProc | Where-Object { (& $matchesScope $_) -and -not (& $isProtected $_) -and -not (& $isNewProc $_) })
+$targets = $roots
+
+# ---- 完整性自检：低权限管道看不见也打不开别的进程，此时「零候选」是权限不足，不是没有可冻的东西
+$integrity = 'unknown'
+try {
+  $ir = [GB]::Integrity()
+  if ($ir -like 'OK|*') {
+    switch ([int]($ir -split '\|')[1]) {
+      0      { $integrity = 'untrusted' }
+      4096   { $integrity = 'low' }
+      8192   { $integrity = 'medium' }
+      8448   { $integrity = 'high' }
+      12288  { $integrity = 'system' }
+      default { $integrity = ('sid-' + ($ir -split '\|')[1]) }
+    }
+  } else { $integrity = ('error-' + $ir) }
+} catch { $integrity = 'error-exception' }
+$MinVisibleProcs = 40   # 本机实测：Low≈10，Medium≈221；低于此值说明枚举被完整性拦掉了
+# 分两类统计：会话 0 的服务本来就不在范围内，读不到路径不影响干活；
+# 真正决定「有没有活可干」的是用户会话里有多少进程能过路径门。
+$userProc  = @($allProc | Where-Object { [int]$_.SessionId -gt 0 })
+$unreadableUser = @($userProc  | Where-Object { $imageVerdict[[int]$_.Id] -eq 'unreadable' }).Count
+$windowsUser    = @($userProc  | Where-Object { $imageVerdict[[int]$_.Id] -eq 'windows' }).Count
+$appUser        = @($userProc  | Where-Object { $imageVerdict[[int]$_.Id] -eq 'app' }).Count
+$unreadablePathProcs = @($allProc | Where-Object { $imageVerdict[[int]$_.Id] -eq 'unreadable' }).Count
+$windowsImageProcs   = @($allProc | Where-Object { $imageVerdict[[int]$_.Id] -eq 'windows' }).Count
+$lowVisibility = ($allProc.Count -lt $MinVisibleProcs)
+if ($lowVisibility) {
+  Log ('警告：只枚举到 ' + $allProc.Count + ' 个进程（本机实际 200+），当前完整性=' + $integrity +
+       '。这个权限看不见也打不开别的进程，「零候选」是权限不足，不是没有可冻结的进程。') 'Red'
+} else {
+  Log ('枚举自检：完整性=' + $integrity + '，共 ' + $allProc.Count + ' 个进程，用户会话 ' + $userProc.Count +
+       ' 个（路径可读的应用映像 ' + $appUser + '，Windows 目录 ' + $windowsUser + '，读不到 ' + $unreadableUser + '）。') 'DarkGray'
+}
+
+if (-not $NoChildren -and $map.Count -gt 0) {
+  try {
+    $kids = @{}
+    foreach ($kv in $map.GetEnumerator()) {
+      if (-not $kids.ContainsKey([int]$kv.Value)) { $kids[[int]$kv.Value] = New-Object 'System.Collections.Generic.List[int]' }
+      $kids[[int]$kv.Value].Add([int]$kv.Key)
+    }
+    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($r in $roots) { [void]$seen.Add([int]$r.Id) }
+    $queue = New-Object 'System.Collections.Generic.Queue[int]'
+    foreach ($r in $roots) { $queue.Enqueue([int]$r.Id) }
+    $extra = New-Object 'System.Collections.Generic.List[object]'
+    while ($queue.Count -gt 0) {
+      $id = [int]$queue.Dequeue()
+      if (-not $kids.ContainsKey($id)) { continue }
+      foreach ($cidRaw in $kids[$id]) {
+        $cid = [int]$cidRaw
+        if ($seen.Contains($cid)) { continue }
+        [void]$seen.Add($cid)
+        $cp = @($allProc | Where-Object { $_.Id -eq $cid })
+        if ($cp.Count -gt 0 -and -not (& $isProtected $cp[0])) { $extra.Add($cp[0]); $queue.Enqueue($cid) }
+      }
+    }
+    $targets = [object[]]($roots) + [object[]]($extra.ToArray())
+  } catch { Log ('警告：子进程展开失败，仅处理匹配进程(' + $_.Exception.Message + ' | line=' + [string]$_.InvocationInfo.ScriptLineNumber + ')') 'Yellow' }
+}
+$targets = @($targets | Sort-Object ProcessName, Id -Unique)
+
+# ---------------------------------------------------------------- 4b. 档案/规则表 → 自动选择
+# 决策按「进程名」聚合（与 GUI 列表、-EmitJson 的行一致）：内存门槛用该名字下所有进程的工作集之和判断，
+# 这样浏览器/Electron 的多个小助手进程不会被逐个漏掉。规则按顺序匹配，首个命中生效；
+# action: suspend(冻结) | idle(只降 QoS) | skip(不处理)；硬保护名单（反作弊/杀毒/会话0/自身链）永远优先。
+$script:ActionOf = @{}
+$script:RuleOf = @{}
+$profMinMB = 0
+if ($script:ActiveProfile -and $script:ActiveProfile.minMemoryMB) { $profMinMB = [int]$script:ActiveProfile.minMemoryMB }
+if ($script:ExplicitList -and $script:RuleSet.Count -gt 0) { Log '显式名单优先：规则表不参与筛选（档案 exclude 与系统硬保护保持生效）' 'Cyan' }
+if ($script:RuleSet.Count -gt 0 -or $profMinMB -gt 0 -or ($script:ActiveProfile -and $script:ActiveProfile.exclude)) {
+  $wsOf = @{}
+  $byName = @{}
+  foreach ($p in $targets) {
+    $n = $p.ProcessName
+    # 2026-11-01：SearchHost（Windows 搜索界面）的 WebView2 子进程绝不能冻——冻了开始菜单/搜索
+    # 会卡死，系统跟着一顿一顿。Edge 自己的 WebView2 照常冻结，所以这里按「父进程名」区分，
+    # 不是把 msedgewebview2 整个排除。
+    # 注意：WebView2 是多进程的——只有根进程的父是 SearchHost，渲染/GPU/网络/存储那些子进程
+    # 的父是根进程自己。所以必须沿父链往上走，不能只看直接父进程。
+    if ($n -eq 'msedgewebview2') {
+      $cur = [int]$p.Id
+      $fromSearch = $false
+      for ($hop = 0; $hop -lt 8; $hop++) {
+        $cur = [int]$map[$cur]
+        if ($cur -le 0) { break }
+        # CIM 的 Name 带 .exe 后缀（SearchHost.exe），所以用正则而不是相等比较
+        if ([string]$nameOf[$cur] -match '^SearchHost(\.exe)?$') { $fromSearch = $true; break }
+      }
+      if ($fromSearch) { continue }
+    }
+    $w = 0; try { $w = [int]([math]::Round($p.WorkingSet64 / 1MB, 0)) } catch { }
+    if ($wsOf.ContainsKey($n)) { $wsOf[$n] = [int]$wsOf[$n] + $w } else { $wsOf[$n] = $w }
+    if (-not $byName.ContainsKey($n)) { $byName[$n] = New-Object System.Collections.Generic.List[object] }
+    $byName[$n].Add($p)
+  }
+  $kept = New-Object System.Collections.Generic.List[object]
+  $skipped = New-Object System.Collections.Generic.List[string]
+  foreach ($n in ($byName.Keys | Sort-Object)) {
+    $ws = [int]$wsOf[$n]
+    $action = $null; $ruleName = '(默认)'; $ruleOwnsMin = $false
+    if ($script:ActiveProfile -and $script:ActiveProfile.exclude) {
+      foreach ($pat in @($script:ActiveProfile.exclude)) { if ($n -like $pat) { $action = 'skip'; $ruleName = '档案排除'; break } }
+    }
+    if ($null -eq $action -and -not $script:ExplicitList) {
+      foreach ($r in $script:RuleSet) {
+        $pat = [string]$r.match
+        if (-not $pat) { continue }
+        $hit = $false
+        foreach ($piece in ($pat -split '\|')) { if ($n -like $piece.Trim()) { $hit = $true; break } }
+        if (-not $hit) { continue }
+        if ($r.minMemoryMB -and ($ws -lt [int]$r.minMemoryMB)) { continue }
+        if ($r.maxMemoryMB -and ($ws -gt [int]$r.maxMemoryMB)) { continue }
+        $action = 'suspend'
+        if ($r.action) { $action = [string]$r.action }
+        $ruleName = [string]$r.name
+        # 规则自带门槛时以规则为准：档案级门槛不得再把这条规则筛掉的对象改回 skip
+        if ($r.minMemoryMB -or $r.maxMemoryMB) { $ruleOwnsMin = $true }
+        break
+      }
+    }
+    if ($null -eq $action) { $action = 'suspend' }
+    if ($action -ne 'skip' -and $ruleOwnsMin -and $action -ne 'suspend') { $ruleOwnsMin = $false }
+    if (-not $script:ExplicitList -and -not $ruleOwnsMin -and $profMinMB -gt 0 -and $ws -lt $profMinMB) { $action = 'skip'; $ruleName = '档案内存门槛(<' + $profMinMB + 'MB)' }
+    if ($script:ExplicitList) {
+      # 显式名单不写 ActionOf，让 -Mode Idle 等命令行语义照常生效；只有档案 exclude 命中的 skip 需要记账以便剔除
+      if ($action -eq 'skip') { $script:ActionOf[$n] = 'skip'; $script:RuleOf[$n] = $ruleName }
+    } else {
+      $script:ActionOf[$n] = $action
+      $script:RuleOf[$n] = $ruleName
+    }
+    if ($action -eq 'skip') { $skipped.Add(($n + ' ' + $ws + 'MB(' + $ruleName + ')')) ; continue }
+    foreach ($p in $byName[$n]) { $kept.Add($p) }
+  }
+  $targets = [object[]]($kept.ToArray())
+  $keptNames = @($targets | Group-Object ProcessName | ForEach-Object { $_.Name } | Sort-Object)
+  Log ('规则/档案筛选：按名字 ' + $byName.Count + ' 个 → 冻结 ' + $keptNames.Count + ' 个名字 / ' + $targets.Count + ' 个进程（跳过 ' + $skipped.Count + ' 个名字）') 'Cyan'
+  if ($script:ActionOf.Count -gt 0) { foreach ($n in $keptNames) { Log ('   [{0,-7}] {1,-28} {2,6}MB  ← {3}' -f $script:ActionOf[$n], $n, $wsOf[$n], $script:RuleOf[$n]) 'DarkGray' } }
+  if ($skipped.Count -gt 0) { Log ('   跳过：' + (($skipped | Select-Object -First 8) -join ', ') + $(if ($skipped.Count -gt 8) { ' …共 ' + $skipped.Count + ' 个' } else { '' })) 'DarkGray' }
+}
+if ($targets.Count -eq 0 -and -not $EmitJson) { Log ('没有匹配到可暂停的进程（Scope=' + $Scope + '）') 'Yellow'; exit 0 }
+# 注意：-EmitJson 时不提前退出——即使规则表把所有名字都判为 skip，也要输出清单（含每行 action/rule），
+# 否则 GUI 会读到上一次的陈旧 scan.json（名单漂移）。
+
+$useIdle = { param($name) if ($script:ActionOf.ContainsKey($name)) { return ($script:ActionOf[$name] -eq 'idle') }; ($Mode -eq 'Idle') -or (($Mode -eq 'Suspend') -and ($cfg.idleByDefault -contains $name)) }
+
+# ---------------------------------------------------------------- 5. 预览
+$grouped = @($targets | Group-Object ProcessName | ForEach-Object {
+  $ws = 0.0; foreach ($p in $_.Group) { $ws += $p.WorkingSet64 }
+  [pscustomobject]@{ Name = $_.Name; N = $_.Count; WS = [math]::Round($ws / 1MB, 0) }
+} | Sort-Object WS -Descending)
+$totalWS = ($grouped | Measure-Object WS -Sum).Sum
+# ---- GUI 用：输出候选清单 JSON（复用同一套保护/范围判定，避免两份名单漂移） ----
+if ($EmitJson) {
+  if (-not $JsonOut) { $JsonOut = Join-Path $StateDir 'scan.json' }
+  $rows = @()
+  foreach ($g in ($allProc | Group-Object ProcessName)) {
+    $ws = 0.0; $np = 0; $protCount = 0; $selCount = 0; $sessList = @()
+    $critCount = 0; $winCount = 0; $fgHit = $false
+    foreach ($p in $g.Group) {
+      $np++
+      try { $ws += $p.WorkingSet64 } catch { }
+      $sessList += [int]$p.SessionId
+      if ($fgAnyPid -gt 0 -and [int]$p.Id -eq $fgAnyPid) { $fgHit = $true }
+      if (& $isProtected $p) { $protCount++ } elseif (& $matchesScope $p) {
+        $selCount++
+        if ($p.MainWindowHandle -ne 0) { $winCount++ }
+        if ([GB]::Critical([int]$p.Id) -eq 'T') { $critCount++ }
+      }
+    }
+    $state = 'out-of-scope'
+    if ($selCount -gt 0) { $state = 'candidate' } elseif ($protCount -gt 0) { $state = 'protected' }
+    $act = ''; $rname = ''
+    if ($script:ActionOf.ContainsKey($g.Name)) { $act = [string]$script:ActionOf[$g.Name]; $rname = [string]$script:RuleOf[$g.Name] }
+    $rows += [pscustomobject]@{ name = $g.Name; n = $np; wsMB = [math]::Round($ws / 1MB, 0); sessions = @($sessList | Sort-Object -Unique); state = $state; targetCount = $selCount; protectedCount = $protCount; action = $act; rule = $rname; critical = $critCount; hasWindow = $winCount; foreground = $fgHit }
+  }
+  $adm = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  $payload = [pscustomobject]@{
+    schema = 1; scope = $Scope; mode = $Mode; admin = $adm
+    profile = $Profile; ruleCount = $script:RuleSet.Count
+    totalProcs = $allProc.Count; candidateProcs = $targets.Count; candidateMB = [int]$totalWS
+    integrity = $integrity; lowVisibility = $lowVisibility
+    unreadablePathProcs = $unreadablePathProcs; windowsImageProcs = $windowsImageProcs
+    userProcs = $userProc.Count; appUserProcs = $appUser
+    unreadableUserProcs = $unreadableUser; windowsUserProcs = $windowsUser
+    hasSession = (Test-Path $StateFile); stateFile = $StateFile
+    processes = $rows
+  }
+  [IO.File]::WriteAllText($JsonOut, ($payload | ConvertTo-Json -Depth 5 -Compress), (New-Object Text.UTF8Encoding($false)))
+  Write-Output $JsonOut
+  exit 0
+}
+Log ('计划处理 ' + $targets.Count + ' 个进程 / ' + $grouped.Count + ' 个名字，预计回收工作集 ' + $totalWS + ' MB  [Scope=' + $Scope + ' Mode=' + $Mode + ']') 'Cyan'
+foreach ($g in $grouped) { Log ('   {0,-28} {1,3}p  {2,6} MB' -f $g.Name, $g.N, $g.WS) }
+if ($DefenderHint) { Log '提示：MsMpEng(Defender) 常占最多 CPU，但不可挂起（篡改防护+PPL）。正解是给游戏目录加排除项。' 'Yellow' }
+if ($DryRun) { Log 'DRY-RUN 结束，未做任何改动。' 'Green'; exit 0 }
+if (-not $Yes) {
+  $a = Read-Host '确认执行？被冻结应用的窗口会假死（恢复即正常）。输入 Y 继续'
+  if ($a -notmatch '^[Yy]') { Log '已取消。'; exit 0 }
+}
+
+# ---------------------------------------------------------------- 6. 合并既有会话
+$entries = @()
+if (Test-Path $StateFile) {
+  try {
+    $j = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($j -and $j.entries) { $entries = @($j.entries) }
+  } catch { Log '旧日志损坏，忽略' 'Yellow' }
+}
+$liveMap = @{}
+foreach ($e in $entries) { if ($e.mode -eq 'Suspend' -and [int]$e.suspendCount -gt 0) { $liveMap[[int]$e.pid] = $true } }
+if ($liveMap.Count -gt 0) { Log ('发现既有会话：' + $liveMap.Count + ' 个进程仍处冻结态，本次合并（不重复挂起）') 'Yellow' }
+
+# ---------------------------------------------------------------- 7. 执行（流水线：批量下发 → 单次等待 → 单次快照校验）
+# 性能关键：原实现每个目标都 Start-Sleep 400ms 做校验，N 个目标就要 N×0.4 秒（146 进程≈70 秒）。
+# 现在改为「读快照 → 批量冻结 → 只等一次 → 只快照一次」，N 个目标仍只付一次等待成本。
+$ok = 0; $skip = 0; $fail = 0; $wsSum = 0; $needResuspend = @()
+$plan = New-Object System.Collections.Generic.List[object]
+foreach ($p in $targets) {
+  $name = $p.ProcessName
+  if ($liveMap.ContainsKey([int]$p.Id)) { Log ('   跳过(已在本次会话冻结) {0} pid {1}' -f $name, $p.Id) 'DarkGray'; $skip++; continue }
+  $crit = [GB]::Critical($p.Id)
+  if ($crit -eq 'T') { Log ('   跳过(系统关键进程) {0} pid {1}' -f $name, $p.Id) 'DarkGray'; $skip++; continue }
+  $start = 0; $path = ''; $ws = 0; $cpu0 = -1.0
+  try { $start = $p.StartTime.ToUniversalTime().Ticks } catch { }
+  try { $path = $p.Path } catch { }
+  try { $ws = $p.WorkingSet64 } catch { }
+  try { $cpu0 = $p.TotalProcessorTime.TotalSeconds } catch { }
+  [void]$plan.Add([pscustomobject]@{ P = $p; Name = $name; Start = $start; Path = $path; Ws = $ws; Cpu0 = $cpu0 })
+}
+
+$applied = New-Object System.Collections.Generic.List[object]
+foreach ($it in $plan) {
+  $r = if (& $useIdle $it.Name) { [GB]::Idle([int]$it.P.Id, $true, 1) } else { [GB]::Suspend([int]$it.P.Id, (-not $NoTrim), $true, 1) }
+  [void]$applied.Add([pscustomobject]@{ It = $it; R = $r })
+}
+
+$anySuspend = 0
+foreach ($a in $applied) { if ($a.R -like 'OK|*' -and $a.R.Split('|')[4] -ne '0') { $anySuspend++ } }
+$snap = @{}
+if ($anySuspend -gt 0) {
+  Start-Sleep -Milliseconds 400
+  foreach ($q in @(Get-Process -ErrorAction SilentlyContinue)) { $snap[[int]$q.Id] = $q }
+}
+
+foreach ($a in $applied) {
+  $it = $a.It; $r = $a.R; $p = $it.P
+  if ($r -like 'OK|*') {
+    $f = $r.Split('|')
+    $modeUsed = 'Suspend'; if ($f[4] -eq '0') { $modeUsed = 'Idle' }
+    $note = 'trim=' + $f[5]
+    if ($modeUsed -eq 'Suspend' -and $snap.ContainsKey([int]$p.Id)) {
+      $cp = $snap[[int]$p.Id]
+      $cpu1 = -1.0; try { $cpu1 = $cp.TotalProcessorTime.TotalSeconds } catch { }
+      $susp = 0; $tot = 0
+      try { $tot = @($cp.Threads).Count; $susp = @($cp.Threads | Where-Object { $_.ThreadState -eq 'Wait' -and $_.WaitReason -eq 'Suspended' }).Count } catch { }
+      if ($it.Cpu0 -ge 0 -and $cpu1 -ge 0 -and (($cpu1 - $it.Cpu0) -gt 0.02)) {
+        $needResuspend += [int]$p.Id
+        $note += (' cpu+' + [math]::Round(($cpu1 - $it.Cpu0) * 1000, 0) + 'ms!')
+      } else { $note += (' susp=' + $susp + '/' + $tot) }
+    }
+    $entries += [pscustomobject]@{
+      pid = [int]$p.Id; name = $it.Name; startUtcTicks = $it.Start; path = $it.Path; wsMB = [math]::Round($it.Ws / 1MB, 0)
+      mode = $modeUsed; suspendCount = [int]$f[4]; origPrio = [int]$f[1]; origMem = [int]$f[2]; origEco = [int]$f[3]; mask = $f[6]
+    }
+    $wsSum += $it.Ws
+    LogFast ('   OK  {0,-26} pid {1,-7} {2,-8} {3,6} MB  {4}' -f $it.Name, $p.Id, $modeUsed, [math]::Round($it.Ws / 1MB, 0), $note) 'Green'
+    $ok++
+  }
+  elseif ($r -eq 'E5') { LogFast ('   跳过(拒绝访问/受保护) {0} pid {1}' -f $it.Name, $p.Id) 'DarkGray'; $skip++ }
+  elseif ($r -eq 'E87') { LogFast ('   跳过(参数不被支持) {0} pid {1}' -f $it.Name, $p.Id) 'DarkGray'; $skip++ }
+  else { LogFast ('   失败 {0} pid {1} -> {2}' -f $it.Name, $p.Id, $r) 'Red'; $fail++ }
+}
+FlushFast
+
+# ---------------------------------------------------------------- 8. 校验 / 二重挂起
+if ($needResuspend.Count -gt 0) {
+  Log ('校验发现 ' + $needResuspend.Count + ' 个进程仍有活动线程(BYPASS_PROCESS_FREEZE 线程): ' + ($needResuspend -join ',')) 'Yellow'
+  if ($ReSuspend) {
+    foreach ($id in $needResuspend) {
+      $rr = [GB]::Suspend($id, $false, $true, 1)
+      if ($rr -like 'OK|*') {
+        foreach ($e in $entries) { if ([int]$e.pid -eq $id) { $e.suspendCount = [int]$e.suspendCount + 1 } }
+        Log ('   已二重挂起 pid ' + $id + '（日志记 suspendCount=2，恢复时会调用两次）') 'Yellow'
+      }
+    }
+  } else { Log '   未二重挂起（需 -ReSuspend 显式开启）；这些进程可能仍占用部分 CPU。' 'Yellow' }
+}
+
+# ---------------------------------------------------------------- 9. 游戏提优先级（可选）
+if ($BoostGame) {
+  $gp = @(Get-Process $BoostGame -ErrorAction SilentlyContinue)
+  if ($gp.Count -eq 0) { Log ('未找到游戏进程 ' + $BoostGame) 'Yellow' }
+  else {
+    foreach ($g in $gp) {
+      $op = -1
+      $q = [GB]::Query($g.Id)
+      if ($q -notlike 'E*') { $op = [int]($q.Split('|')[0]) }
+      $gStart = 0; try { $gStart = $g.StartTime.ToUniversalTime().Ticks } catch { }
+      [GB]::Boost($g.Id)
+      $entries += [pscustomobject]@{
+        pid = [int]$g.Id; name = $g.ProcessName; startUtcTicks = $gStart; path = ''; wsMB = 0
+        mode = 'Boost'; suspendCount = 0; origPrio = $op; origMem = -1; origEco = -1; mask = 'full'
+      }
+      Log ('   已提升游戏优先级 {0} pid {1}' -f $g.ProcessName, $g.Id) 'Green'
+    }
+  }
+}
+
+# ---------------------------------------------------------------- 10. 写日志
+$doc = [pscustomobject]@{
+  schema = 1; startedUtc = (Get-Date).ToUniversalTime().ToString('o'); host = 'local'   # 不写入计算机名，避免用户粘贴日志时带出主机信息
+  scope = $Scope; mode = $Mode; toolPid = $PID; protectedCount = $Protected.Count; entries = $entries
+}
+[IO.File]::WriteAllText($StateFile, ($doc | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+
+# ---------------------------------------------------------------- 11. 自动恢复守护
+if ($AutoResumeMinutes -gt 0 -or $ResumeWhenProcessExits) {
+  $resume = Join-Path $Root 'resume-non-system-processes.ps1'
+  $psArgs = @('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File', $resume, '-Yes','-Quiet')
+  if ($AutoResumeMinutes -gt 0) { $psArgs += @('-MaxMinutes', $AutoResumeMinutes) }
+  if ($ResumeWhenProcessExits) {
+    $psArgs += @('-WaitProcessExit', $ResumeWhenProcessExits)
+    # 把挂起时刻已观察到的 PID 一并交给守护进程：避免守护进程启动的 1-2 秒内目标就退出导致的竞态
+    $seedPids = @(Get-Process -Name $ResumeWhenProcessExits -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
+    if ($seedPids.Count -gt 0) { $psArgs += @('-WaitProcessIds', ($seedPids -join ',')) }
+  }
+  Start-Process powershell -ArgumentList $psArgs -WindowStyle Hidden | Out-Null
+  $parts = @()
+  if ($AutoResumeMinutes -gt 0) { $parts += ($AutoResumeMinutes.ToString() + ' 分钟到期') }
+  if ($ResumeWhenProcessExits) { $parts += ($ResumeWhenProcessExits + ' 全部退出') }
+  Log ('已派发隐藏守护进程：' + ($parts -join ' 或 ') + ' 时自动恢复') 'Cyan'
+}
+
+Log ('完成：成功 ' + $ok + ' / 跳过 ' + $skip + ' / 失败 ' + $fail + '；共回收工作集 ' + [math]::Round($wsSum / 1MB, 0) + ' MB') 'Cyan'
+Log ('日志：' + $LogFile + '   会话文件：' + $StateFile) 'Cyan'
+Log '恢复请运行 resume-non-system-processes.ps1（或双击 GameBoost.resume.cmd / 热键 Ctrl+Alt+R）' 'Cyan'

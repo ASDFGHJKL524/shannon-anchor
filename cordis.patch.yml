@@ -1,0 +1,42 @@
+# shannon-anchor — portable persistent memory + guard rails for DSH agents
+#
+# Install:
+#   dsh plugin --profile web add github:<your-org>/shannon-anchor
+#
+# The plugin registers (in lib/index.js):
+#   - memory_recall / memory_list tools   (manual retrieval, on demand)
+#   - memory_write tool                    (goes through the write-guard gate)
+#   - tools/pre-execute interception       (delete/write actions hit the guard first)
+#   - ctx.systemPrompt.section()           (dynamic "go check the manual" injection)
+#
+# All paths and thresholds live in `config`; the row below restates every
+# owned key so later layers can override individual values.
+# ── v2 说明 ─────────────────────────────────────────────────────
+# 数据与代码同根：manualRoot 默认指向 ~/.dsh/shannon-anchor，
+# 整个目录一起搬走就能在新机器上复原，不散落在 ~/.dsh 里。
+#
+# v2 带的东西：
+#   - 手册是分层索引 + 编号条目（出处、半衰期、候选转正）
+#   - 写入守卫 + 删除守卫 + 核心区写入白名单
+#   - 预测性召回、经验路由、人格判例库
+#   - review / distill / voice 三类有界队列
+#   - 三层遗忘与淘汰账本
+- insert:
+    - id: shannon-anchor
+      name: shannon-anchor
+      config:
+        # Where the manual lives. Default is under the DSH home.
+        manualRoot: "~/.dsh/shannon-anchor"
+        # 身份内容进系统提示（identity.md 已存在，不再走 bootstrap 提问）。
+        # 关掉它只是少一段常驻提示，不影响手册检索与两道守卫。
+        injectIdentity: true
+        # Guard switches. Turning these off degrades to "logs only".
+        guardWrites: true
+        guardDeletes: true
+        # Dynamic system-prompt injection ("go check the manual for X").
+        injectManualHints: true
+        # Half-life thresholds (days) by confidence class.
+        coldConfirmedDays: 30
+        staleConfirmedDays: 90
+        coldInferredDays: 15
+        staleInferredDays: 45

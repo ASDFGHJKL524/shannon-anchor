@@ -1,0 +1,6 @@
+{
+  "version": 2,
+  "note": "Instruction numbers are stable semantic ids. The resident prompt shows only this tiny table (number -> task class); the entries live in your own manual. Changing an entry's content never touches the table; adding a class appends a number. Never renumber. `entries` carries both the path and the entry number, because instruction number and entry number are separate concepts: the instruction is what a trigger says, the entry is what memory_recall takes.",
+  "instructions": {},
+  "_note": "这张表把「按指令 N」映射到你自己手册里的条目号。留空是刻意的：条目号因人而异，填进来的是你自己的手册。"
+}

@@ -1,0 +1,55 @@
+{
+  "name": "shannon-anchor",
+  "version": "1.0.0",
+  "description": "给 DeepSeek Harness 的持久记忆与护栏插件。作用有跨会话记忆，错题本积累，或者说经验库积累，以及一定的约束能力，能让模型在可能的错误面前踩刹车。",
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": {
+      "default": "./client.js"
+    },
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "lib",
+    "conf",
+    "engine",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test/run.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:ASDFGHJKL524/shannon-anchor.git"
+  },
+  "homepage": "https://github.com/ASDFGHJKL524/shannon-anchor",
+  "bugs": {
+    "url": "https://github.com/ASDFGHJKL524/shannon-anchor/issues"
+  },
+  "author": "ASDFGHJKL524",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "persistent-memory",
+    "agent-memory",
+    "guardrails",
+    "persona"
+  ]
+}
